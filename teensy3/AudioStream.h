@@ -61,6 +61,23 @@
 class AudioStream;
 class AudioConnection;
 
+#define AUDIO_FLOAT
+
+#ifdef AUDIO_FLOAT
+
+#define AUDIO_BLOCK_INT16 0
+#define AUDIO_BLOCK_FLOAT 1
+
+typedef struct audio_block_struct {
+	unsigned char ref_count;
+	unsigned char memory_pool_index;
+	unsigned char type;
+	unsigned char reserved2;
+	struct audio_block_struct * nextBlock;
+	int16_t data[AUDIO_BLOCK_SAMPLES];
+} audio_block_t;
+
+#else
 typedef struct audio_block_struct {
 	unsigned char ref_count;
 	unsigned char memory_pool_index;
@@ -68,6 +85,13 @@ typedef struct audio_block_struct {
 	unsigned char reserved2;
 	int16_t data[AUDIO_BLOCK_SAMPLES];
 } audio_block_t;
+
+#endif
+
+typedef enum {
+	AUDIO_STREAM_INT16,
+	AUDIO_STREAM_FLOAT
+} AudioStreamType_t;
 
 
 class AudioConnection
@@ -138,7 +162,34 @@ public:
 			cpu_cycles = 0;
 			cpu_cycles_max = 0;
 			numConnections = 0;
+			type = AUDIO_STREAM_INT16;
 		}
+
+#ifdef AUDIO_FLOAT
+	AudioStream(unsigned char ninput, audio_block_t **iqueue, AudioStreamType_t itype) :
+		num_inputs(ninput), inputQueue(iqueue) {
+			active = false;
+			destination_list = NULL;
+			for (int i=0; i < num_inputs; i++) {
+				inputQueue[i] = NULL;
+			}
+			// add to a simple list, for update_all
+			// TODO: replace with a proper data flow analysis in update_all
+			if (first_update == NULL) {
+				first_update = this;
+			} else {
+				AudioStream *p;
+				for (p=first_update; p->next_update; p = p->next_update) ;
+				p->next_update = this;
+			}
+			next_update = NULL;
+			cpu_cycles = 0;
+			cpu_cycles_max = 0;
+			numConnections = 0;
+			type = itype;
+		}
+#endif
+
 	static void initialize_memory(audio_block_t *data, unsigned int num);
 	int processorUsage(void) { return CYCLE_COUNTER_APPROX_PERCENT(cpu_cycles); }
 	int processorUsageMax(void) { return CYCLE_COUNTER_APPROX_PERCENT(cpu_cycles_max); }
@@ -151,6 +202,7 @@ public:
 	static uint8_t memory_used;
 	static uint8_t memory_used_max;
 protected:
+	AudioStreamType_t type;
 	bool active;
 	unsigned char num_inputs;
 	static audio_block_t * allocate(void);
@@ -158,6 +210,11 @@ protected:
 	void transmit(audio_block_t *block, unsigned char index = 0);
 	audio_block_t * receiveReadOnly(unsigned int index = 0);
 	audio_block_t * receiveWritable(unsigned int index = 0);
+#ifdef AUDIO_FLOAT
+	static audio_block_t * allocateFloat(void);
+	audio_block_t * receiveReadOnlyFloat(unsigned int index = 0);
+	audio_block_t * receiveWritableFloat(unsigned int index = 0);
+#endif
 	static bool update_setup(void);
 	static void update_stop(void);
 	static void update_all(void) { NVIC_SET_PENDING(IRQ_SOFTWARE); }

@@ -30,6 +30,7 @@
 
 
 #include <string.h> // for memcpy
+#include <arm_math.h>
 #include "AudioStream.h"
 
 
@@ -40,6 +41,18 @@ uint16_t AudioStream::cpu_cycles_total = 0;
 uint16_t AudioStream::cpu_cycles_total_max = 0;
 uint8_t AudioStream::memory_used = 0;
 uint8_t AudioStream::memory_used_max = 0;
+
+//Uncomment to disable debug printing
+//#define AUDIO_DBG
+
+#ifdef AUDIO_DBG
+#include <Arduino.h>
+#define AUDIO_DBG_PRINT(x) if (Serial) { Serial.print(x); Serial.flush(); }
+#define AUDIO_DBG_PRINTF(x,y) if (Serial) { Serial.printf(x,y); Serial.flush(); }
+#else
+#define AUDIO_DBG_PRINT(x)
+#define AUDIO_DBG_PRINTF(x,y)
+#endif
 
 
 
@@ -97,11 +110,42 @@ audio_block_t * AudioStream::allocate(void)
 	index = p - memory_pool_available_mask;
 	block = memory_pool + ((index << 5) + (31 - n));
 	block->ref_count = 1;
+#ifdef AUDIO_FLOAT
+	block->nextBlock = NULL;
+	block->type = AUDIO_BLOCK_INT16;
+#endif
 	if (used > memory_used_max) memory_used_max = used;
-	//Serial.print("alloc:");
-	//Serial.println((uint32_t)block, HEX);
+//	Serial.print("alloc:"); Serial.printf(" type: %d   ", block->type);
+//	Serial.println((uint32_t)block, HEX);
 	return block;
 }
+
+#ifdef AUDIO_FLOAT
+
+// Allocate 2 chained audio blocks,  If successful
+// the caller is the only owner of these new blocks
+audio_block_t * AudioStream::allocateFloat(void) {
+//	Serial.print("float:");
+	audio_block_t * block1 = allocate();
+	if (block1 == NULL) return NULL;
+
+	//AUDIO_DBG_PRINT("Allocatefloat: block1-ok \n");
+//	Serial.print("float:");
+	audio_block_t * block2 = allocate();
+	if (block2 == NULL) {
+		release(block1);
+		return NULL;
+	}
+	//AUDIO_DBG_PRINT("Allocatefloat: block2-ok \n");
+	block1->type = AUDIO_BLOCK_FLOAT;
+	block1->nextBlock = block2;
+	block2->type = AUDIO_BLOCK_FLOAT;
+	block2->nextBlock = NULL;
+
+	return block1;
+}
+#endif
+
 
 // Release ownership of a data block.  If no
 // other streams have ownership, the block is
@@ -111,8 +155,34 @@ void AudioStream::release(audio_block_t *block)
 	uint32_t mask = (0x80000000 >> (31 - (block->memory_pool_index & 0x1F)));
 	uint32_t index = block->memory_pool_index >> 5;
 
-
 	__disable_irq();
+
+#ifdef AUDIO_FLOAT
+	if (block->type == AUDIO_BLOCK_FLOAT && block->nextBlock != NULL) {
+	//	AUDIO_DBG_PRINT("release float\n");
+		audio_block_t * block2 = block->nextBlock;
+
+//		Serial.print("release:"); Serial.printf(" type: %d   ", block2->type);
+//		Serial.println((uint32_t)block2, HEX);
+
+
+		uint32_t mask2 = (0x80000000 >> (31 - (block2->memory_pool_index & 0x1F)));
+		uint32_t index2 = block2->memory_pool_index >> 5;
+
+		if (block2->ref_count > 1) {
+			block2->ref_count--;
+		} else {
+			//Serial.print("reles:");
+			//Serial.println((uint32_t)block, HEX);
+			memory_pool_available_mask[index2] |= mask2;
+			memory_used--;
+		}
+	}
+#endif
+//	AUDIO_DBG_PRINT("release block\n");
+//	Serial.print("release:"); Serial.printf(" type: %d   ", block->type);
+//	Serial.println((uint32_t)block, HEX);
+
 	if (block->ref_count > 1) {
 		block->ref_count--;
 	} else {
@@ -121,8 +191,12 @@ void AudioStream::release(audio_block_t *block)
 		memory_pool_available_mask[index] |= mask;
 		memory_used--;
 	}
+
+
 	__enable_irq();
 }
+
+
 
 // Transmit an audio data block
 // to all streams that connect to an output.  The block
@@ -133,11 +207,67 @@ void AudioStream::release(audio_block_t *block)
 // and then release it once after all transmit calls.
 void AudioStream::transmit(audio_block_t *block, unsigned char index)
 {
+#ifdef AUDIO_FLOAT
+	audio_block_t * cached_float = NULL;
+	audio_block_t * cached_int = NULL;
+#endif
+
 	for (AudioConnection *c = destination_list; c != NULL; c = c->next_dest) {
 		if (c->src_index == index) {
 			if (c->dst.inputQueue[c->dest_index] == NULL) {
+#ifndef AUDIO_FLOAT
 				c->dst.inputQueue[c->dest_index] = block;
 				block->ref_count++;
+#else
+				if (this->type == c->dst.type) { //No conversion
+					c->dst.inputQueue[c->dest_index] = block;
+					block->ref_count++;
+					if (block->nextBlock) block->nextBlock->ref_count++;
+				} else if (this->type == AUDIO_STREAM_INT16) { //Convert int to float
+					AUDIO_DBG_PRINT("int to float: \n");
+
+					if (cached_float == NULL) { // First time we need to do an conversion
+						cached_float = allocateFloat();
+						if (cached_float != NULL) {
+							arm_q15_to_float( (q15_t *) &block->data[0], (float *) &cached_float->data[0], AUDIO_BLOCK_SAMPLES/2);
+							arm_q15_to_float( (q15_t *) &block->data[AUDIO_BLOCK_SAMPLES/2], (float *) &cached_float->nextBlock->data[0], AUDIO_BLOCK_SAMPLES/2);
+
+							//We must start at 0 with these blocks as the transmitter will not call release on them
+							cached_float->ref_count--;
+							cached_float->nextBlock->ref_count--;
+						}
+					}
+					c->dst.inputQueue[c->dest_index] = cached_float;
+					if (cached_float != NULL) { //Alloc might have failed
+						cached_float->ref_count++;
+						if (cached_float->nextBlock) cached_float->nextBlock->ref_count++;
+
+					}
+					AUDIO_DBG_PRINT("end int to float \n ");
+
+
+				} else { //Convert float to int
+
+					AUDIO_DBG_PRINT("float to int\n");
+
+					if (cached_int == NULL) {
+						cached_int = allocate();
+						if (cached_int != NULL) {
+							arm_float_to_q15((float *) &block->data[0], (q15_t *) &cached_int->data[0], AUDIO_BLOCK_SAMPLES/2);
+							arm_float_to_q15((float *) &block->nextBlock->data[0], (q15_t *) &cached_int->data[AUDIO_BLOCK_SAMPLES/2], AUDIO_BLOCK_SAMPLES/2);
+							//We must start at 0 with these blocks as the transmitter will not call release on them
+							cached_int->ref_count--;
+						}
+					}
+					c->dst.inputQueue[c->dest_index] = cached_int;
+					if (cached_int != NULL) {
+						cached_int->ref_count++;
+
+					}
+					AUDIO_DBG_PRINT("end float to int\n");
+
+				}
+#endif
 			}
 		}
 	}
@@ -174,6 +304,55 @@ audio_block_t * AudioStream::receiveWritable(unsigned int index)
 	return in;
 }
 
+
+#ifdef AUDIO_FLOAT
+
+audio_block_t * AudioStream::receiveReadOnlyFloat(unsigned int index) {
+	audio_block_t * block = this->receiveReadOnly(index);
+	if (block != NULL && block->type == AUDIO_BLOCK_FLOAT)
+	{
+		return block;
+	}
+	return NULL;
+}
+
+audio_block_t * AudioStream::receiveWritableFloat(unsigned int index) {
+	audio_block_t *in,*out=NULL;
+
+	if (index >= num_inputs) return NULL;
+	in = inputQueue[index];
+	inputQueue[index] = NULL;
+
+	AUDIO_DBG_PRINT("recv writable\n");
+
+	if (in && in->nextBlock && in->ref_count > 1 && in->nextBlock->ref_count > 1) {
+		AUDIO_DBG_PRINT("writable copy needed\n");
+
+		out = allocateFloat();
+		if (out) {
+			memcpy(out->data, in->data, sizeof(out->data));
+			memcpy(out->nextBlock->data, in->nextBlock->data, sizeof(out->nextBlock->data));
+			AUDIO_DBG_PRINT("writable copy executed\n");
+
+		} else {
+			AUDIO_DBG_PRINT("writable copy failed no mem\n");
+
+		}
+
+		in->ref_count--;
+		in->nextBlock->ref_count--;
+
+		in = out;
+	}
+
+	if (in) {
+		AUDIO_DBG_PRINT("return not null");
+	}
+
+
+	return in;
+}
+#endif
 
 void AudioConnection::connect(void)
 {
